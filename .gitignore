@@ -1,0 +1,10 @@
+/target/
+
+# Local and generated robot data.
+*.hoot
+*.wpilog
+*.mcap
+*.parquet
+
+# The committed fixture is generated and contains no robot telemetry.
+!tests/fixtures/*.hoot
