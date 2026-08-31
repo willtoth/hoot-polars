@@ -5,8 +5,8 @@ use crate::error::{HootError, Result};
 use crate::framing::{FrameIter, RawFrame};
 use crate::header::HootHeader;
 use crate::model::{
-    HootSchema, SchemaReport, SignalInfo, SignalSource, SignalSupport, SignalType, SignalUpdate,
-    SignalValue, UnsupportedFrameInfo,
+    DecodedUpdate, FrameKey, HootSchema, SchemaReport, SignalInfo, SignalSource, SignalSupport,
+    SignalType, SignalUpdate, SignalValue, UnsupportedFrameInfo,
 };
 
 const CUSTOM_CLASS: u8 = 7;
@@ -22,14 +22,10 @@ struct CustomHeader {
     subtype: u8,
 }
 
-pub(crate) fn infer_schema(
-    header: &HootHeader,
-    discovery_frames: FrameIter<'_>,
-    mut frames: FrameIter<'_>,
-) -> Result<SchemaReport> {
+pub(crate) fn infer_schema(header: &HootHeader, mut frames: FrameIter<'_>) -> Result<SchemaReport> {
     let mut schema = HootSchema::new();
-    catalog::apply_selection(&mut schema, catalog::discover(discovery_frames)?);
-    let mut unsupported = BTreeMap::<(u32, u8, usize), UnsupportedFrameInfo>::new();
+    let mut discovery = catalog::CatalogDiscovery::default();
+    let mut observed = BTreeMap::<FrameKey, UnsupportedFrameInfo>::new();
     let mut raw_frames = 0_u64;
     let mut custom_frames = 0_u64;
     let mut min_timestamp_us = None;
@@ -39,6 +35,7 @@ pub(crate) fn infer_schema(
 
     for frame in frames.by_ref() {
         let frame = frame?;
+        discovery.observe(&frame);
         raw_frames += 1;
         min_timestamp_us = Some(min_timestamp_us.map_or(frame.timestamp_us, |minimum: i64| {
             minimum.min(frame.timestamp_us)
@@ -56,15 +53,13 @@ pub(crate) fn infer_schema(
         if frame.record_class == CUSTOM_CLASS {
             custom_frames += 1;
             apply_custom_definition(header, &frame, &mut schema)?;
-        } else if let Some(kind) = catalog::classify(&frame, &schema) {
-            catalog::add_schema(header, &frame, kind, &mut schema);
         } else {
-            let key = (
-                frame.arbitration_id,
-                frame.record_class,
-                frame.payload.len(),
-            );
-            let info = unsupported.entry(key).or_insert(UnsupportedFrameInfo {
+            let key = FrameKey {
+                arbitration_id: frame.arbitration_id,
+                record_class: frame.record_class,
+                payload_len: frame.payload.len(),
+            };
+            let info = observed.entry(key).or_insert(UnsupportedFrameInfo {
                 arbitration_id: frame.arbitration_id,
                 record_class: frame.record_class,
                 payload_len: frame.payload.len(),
@@ -78,6 +73,22 @@ pub(crate) fn infer_schema(
         }
     }
 
+    let recovered_tail = frames.tail_recovery().cloned();
+    catalog::apply_selection(&mut schema, discovery.finish());
+    let mut unsupported = Vec::new();
+    let mut catalog_frames = Vec::new();
+    for (key, info) in observed {
+        if let Some(kind) = catalog::classify_key(key, &schema) {
+            catalog_frames.push((info.first_decoded_offset, kind));
+        } else {
+            unsupported.push(info);
+        }
+    }
+    catalog_frames.sort_by_key(|(first_decoded_offset, _)| *first_decoded_offset);
+    for (first_decoded_offset, kind) in catalog_frames {
+        catalog::add_schema(header, first_decoded_offset, kind, &mut schema);
+    }
+
     Ok(SchemaReport {
         schema,
         raw_frames,
@@ -86,8 +97,8 @@ pub(crate) fn infer_schema(
         max_timestamp_us,
         out_of_order_frames,
         max_out_of_order_us,
-        unsupported_frames: unsupported.into_values().collect(),
-        recovered_tail: frames.tail_recovery().cloned(),
+        unsupported_frames: unsupported,
+        recovered_tail,
     })
 }
 
@@ -129,15 +140,15 @@ fn apply_custom_definition(
     Ok(())
 }
 
-pub(crate) struct UpdateIter<'a> {
+pub(crate) struct DecodedUpdateIter<'a> {
     frames: FrameIter<'a>,
     schema: &'a HootSchema,
-    pending: VecDeque<SignalUpdate>,
+    pending: VecDeque<DecodedUpdate>,
     initialized_devices: HashSet<u8>,
     catalog_decoder: catalog::CatalogDecoder,
 }
 
-impl<'a> UpdateIter<'a> {
+impl<'a> DecodedUpdateIter<'a> {
     pub(crate) fn new(frames: FrameIter<'a>, schema: &'a HootSchema) -> Self {
         Self {
             frames,
@@ -149,8 +160,8 @@ impl<'a> UpdateIter<'a> {
     }
 }
 
-impl Iterator for UpdateIter<'_> {
-    type Item = Result<SignalUpdate>;
+impl Iterator for DecodedUpdateIter<'_> {
+    type Item = Result<DecodedUpdate>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(update) = self.pending.pop_front() {
@@ -163,14 +174,16 @@ impl Iterator for UpdateIter<'_> {
             };
             if let Some(kind) = catalog::classify(&frame, self.schema) {
                 let device_id = kind.device_id();
-                let mut updates = match self.catalog_decoder.decode_frame(&frame, kind) {
-                    Ok(updates) => updates,
-                    Err(error) => return Some(Err(error)),
-                };
-                if self.initialized_devices.insert(device_id) {
-                    updates.push(catalog::reset_update(&frame, device_id));
+                if let Err(error) =
+                    self.catalog_decoder
+                        .decode_frame_into(&frame, kind, &mut self.pending)
+                {
+                    return Some(Err(error));
                 }
-                self.pending.extend(updates);
+                if self.initialized_devices.insert(device_id) {
+                    self.pending
+                        .push_back(catalog::reset_update(&frame, device_id));
+                }
                 return self.pending.pop_front().map(Ok);
             }
             if frame.record_class != CUSTOM_CLASS {
@@ -200,15 +213,52 @@ impl Iterator for UpdateIter<'_> {
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
             };
-            return Some(Ok(SignalUpdate {
+            return Some(Ok(DecodedUpdate {
                 timestamp_us: frame.timestamp_us,
                 raw_id: custom.raw_id,
-                name: signal.name.clone(),
                 value,
                 decoded_offset: frame.decoded_offset,
                 compressed_byte_offset: frame.compressed_byte_offset,
             }));
         }
+    }
+}
+
+pub(crate) struct UpdateIter<'a> {
+    inner: DecodedUpdateIter<'a>,
+    schema: &'a HootSchema,
+}
+
+impl<'a> UpdateIter<'a> {
+    pub(crate) fn new(frames: FrameIter<'a>, schema: &'a HootSchema) -> Self {
+        Self {
+            inner: DecodedUpdateIter::new(frames, schema),
+            schema,
+        }
+    }
+}
+
+impl Iterator for UpdateIter<'_> {
+    type Item = Result<SignalUpdate>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|update| {
+            let update = update?;
+            let signal = self.schema.get(update.raw_id).ok_or_else(|| {
+                HootError::Schema(format!(
+                    "update for signal 0x{:x} is absent from the inferred schema",
+                    update.raw_id
+                ))
+            })?;
+            Ok(SignalUpdate {
+                timestamp_us: update.timestamp_us,
+                raw_id: update.raw_id,
+                name: signal.name.clone(),
+                value: update.value,
+                decoded_offset: update.decoded_offset,
+                compressed_byte_offset: update.compressed_byte_offset,
+            })
+        })
     }
 }
 

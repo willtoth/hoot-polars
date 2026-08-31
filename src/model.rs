@@ -215,6 +215,18 @@ pub enum SignalValue {
     StringArray(Vec<String>),
 }
 
+/// Compact semantic update used by ingestion adapters. Signal names remain in
+/// the companion schema so high-volume conversion does not allocate a new
+/// owned name for every observed value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DecodedUpdate {
+    pub timestamp_us: i64,
+    pub raw_id: u32,
+    pub value: SignalValue,
+    pub decoded_offset: u64,
+    pub compressed_byte_offset: u64,
+}
+
 /// One sparse signal update in integer microseconds.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SignalUpdate {

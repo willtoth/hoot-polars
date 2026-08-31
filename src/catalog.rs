@@ -12,8 +12,8 @@ use crate::error::{HootError, Result};
 use crate::framing::RawFrame;
 use crate::header::HootHeader;
 use crate::model::{
-    FrameKey, HootSchema, PhoenixDeviceInfo, PhoenixTransport, SignalInfo, SignalSource,
-    SignalSupport, SignalType, SignalUpdate, SignalValue,
+    DecodedUpdate, FrameKey, HootSchema, PhoenixDeviceInfo, PhoenixTransport, SignalInfo,
+    SignalSource, SignalSupport, SignalType, SignalValue,
 };
 
 const DEVICE_ID_MASK: u32 = 0x3f;
@@ -75,6 +75,145 @@ pub(crate) struct CatalogDecoder {
 struct VersionObservation {
     firmware_full: u32,
     is_pro_licensed: bool,
+}
+
+/// Incremental evidence used to select the versioned Phoenix catalog after a
+/// single physical-frame traversal.
+#[derive(Debug, Default)]
+pub(crate) struct CatalogDiscovery {
+    versions: BTreeMap<(u8, u8), VersionObservation>,
+    version_conflicts: BTreeSet<(u8, u8)>,
+    version_variants: BTreeSet<(u8, u8)>,
+    classic_devices: BTreeSet<u8>,
+    fd_devices: BTreeSet<u8>,
+    observed_status_frames: BTreeSet<FrameKey>,
+}
+
+impl CatalogDiscovery {
+    pub(crate) fn observe(&mut self, frame: &RawFrame) {
+        let base = frame.arbitration_id & FRAME_BASE_MASK;
+        let device_id = (frame.arbitration_id & DEVICE_ID_MASK) as u8;
+        if base == TALON_VERSION_BASE
+            && matches!(frame.record_class, 1 | 3)
+            && frame.payload.len() == 6
+        {
+            self.version_variants
+                .insert((device_id, frame.record_class));
+            let firmware_full =
+                u32::from_le_bytes(frame.payload[..4].try_into().expect("length checked"));
+            if firmware_full != 0 {
+                let key = (device_id, frame.record_class);
+                let observation = VersionObservation {
+                    firmware_full,
+                    is_pro_licensed: frame.payload[5] & 0x80 != 0,
+                };
+                if let Some(previous) = self.versions.get_mut(&key) {
+                    if previous.firmware_full.to_le_bytes()[3]
+                        != observation.firmware_full.to_le_bytes()[3]
+                    {
+                        self.version_conflicts.insert(key);
+                        if observation.firmware_full < previous.firmware_full {
+                            *previous = observation;
+                        }
+                    } else {
+                        if observation.firmware_full > previous.firmware_full {
+                            previous.firmware_full = observation.firmware_full;
+                        }
+                        previous.is_pro_licensed |= observation.is_pro_licensed;
+                    }
+                } else {
+                    self.versions.insert(key, observation);
+                }
+            }
+        }
+        if matches!(frame.record_class, 1 | 3)
+            && frame.payload.len() == 8
+            && is_standalone_status_base(base)
+        {
+            self.observed_status_frames.insert(FrameKey {
+                arbitration_id: frame.arbitration_id,
+                record_class: frame.record_class,
+                payload_len: frame.payload.len(),
+            });
+        }
+        if frame.record_class == 1 && frame.payload.len() == 8 && is_timesync_group_base(base) {
+            self.classic_devices.insert(device_id);
+        }
+        if frame.record_class == 3 && frame.payload.len() == 64 && base == TALON_FD_BUNDLE_BASE {
+            self.fd_devices.insert(device_id);
+        }
+    }
+
+    pub(crate) fn finish(self) -> CatalogSelection {
+        let all_devices = self
+            .classic_devices
+            .union(&self.fd_devices)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut selection = CatalogSelection::default();
+        for device_id in all_devices {
+            let (transport, record_class, version) = if self.fd_devices.contains(&device_id) {
+                match self.versions.get(&(device_id, 3)) {
+                    Some(version) => (PhoenixTransport::CanFd, 3, *version),
+                    None => continue,
+                }
+            } else {
+                match self.versions.get(&(device_id, 1)) {
+                    Some(version) => (PhoenixTransport::Can2, 1, *version),
+                    None => continue,
+                }
+            };
+            let bytes = version.firmware_full.to_le_bytes();
+            let version_conflict = self.version_conflicts.contains(&(device_id, record_class));
+            let supported = bytes[3] == SUPPORTED_FIRMWARE_MAJOR && !version_conflict;
+            selection.devices.push(PhoenixDeviceInfo {
+                device_type: "TalonFX".to_owned(),
+                device_id,
+                firmware_major: bytes[3],
+                firmware_minor: bytes[2],
+                firmware_bugfix: bytes[1],
+                firmware_build: bytes[0],
+                firmware_full: version.firmware_full,
+                is_pro_licensed: version.is_pro_licensed,
+                transport,
+                version_conflict,
+                catalog_supported: supported,
+            });
+            if !supported {
+                continue;
+            }
+
+            let id = u32::from(device_id);
+            selection.frames.extend(
+                self.observed_status_frames
+                    .iter()
+                    .copied()
+                    .filter(|key| key.arbitration_id & DEVICE_ID_MASK == id),
+            );
+            if transport == PhoenixTransport::CanFd {
+                selection.frames.insert(FrameKey {
+                    arbitration_id: TALON_FD_BUNDLE_BASE | id,
+                    record_class,
+                    payload_len: 64,
+                });
+            }
+            selection.frames.insert(FrameKey {
+                arbitration_id: TALON_VERSION_BASE | id,
+                record_class,
+                payload_len: 6,
+            });
+            if transport == PhoenixTransport::CanFd
+                && self.version_variants.contains(&(device_id, 1))
+            {
+                selection.frames.insert(FrameKey {
+                    arbitration_id: TALON_VERSION_BASE | id,
+                    record_class: 1,
+                    payload_len: 6,
+                });
+            }
+        }
+        selection
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -442,135 +581,17 @@ const fn text_def(spn: u32, leaf: &'static str, encoding: TextEncoding) -> Signa
     }
 }
 
+#[cfg(test)]
 pub(crate) fn discover<I>(frames: I) -> Result<CatalogSelection>
 where
     I: IntoIterator<Item = Result<RawFrame>>,
 {
-    let mut versions = BTreeMap::<(u8, u8), VersionObservation>::new();
-    let mut version_conflicts = BTreeSet::<(u8, u8)>::new();
-    let mut version_variants = BTreeSet::<(u8, u8)>::new();
-    let mut classic_devices = BTreeSet::new();
-    let mut fd_devices = BTreeSet::new();
-    let mut observed_status_frames = BTreeSet::<FrameKey>::new();
-
+    let mut discovery = CatalogDiscovery::default();
     for frame in frames {
         let frame = frame?;
-        let base = frame.arbitration_id & FRAME_BASE_MASK;
-        let device_id = (frame.arbitration_id & DEVICE_ID_MASK) as u8;
-        if base == TALON_VERSION_BASE
-            && matches!(frame.record_class, 1 | 3)
-            && frame.payload.len() == 6
-        {
-            version_variants.insert((device_id, frame.record_class));
-            let firmware_full = u32::from_le_bytes(frame.payload[..4].try_into().expect("length"));
-            if firmware_full != 0 {
-                let key = (device_id, frame.record_class);
-                let observation = VersionObservation {
-                    firmware_full,
-                    is_pro_licensed: frame.payload[5] & 0x80 != 0,
-                };
-                if let Some(previous) = versions.get_mut(&key) {
-                    if previous.firmware_full.to_le_bytes()[3]
-                        != observation.firmware_full.to_le_bytes()[3]
-                    {
-                        version_conflicts.insert(key);
-                        if observation.firmware_full < previous.firmware_full {
-                            *previous = observation;
-                        }
-                    } else {
-                        if observation.firmware_full > previous.firmware_full {
-                            previous.firmware_full = observation.firmware_full;
-                        }
-                        previous.is_pro_licensed |= observation.is_pro_licensed;
-                    }
-                } else {
-                    versions.insert(key, observation);
-                }
-            }
-        }
-        if matches!(frame.record_class, 1 | 3)
-            && frame.payload.len() == 8
-            && is_standalone_status_base(base)
-        {
-            observed_status_frames.insert(FrameKey {
-                arbitration_id: frame.arbitration_id,
-                record_class: frame.record_class,
-                payload_len: frame.payload.len(),
-            });
-        }
-        if frame.record_class == 1 && frame.payload.len() == 8 && is_timesync_group_base(base) {
-            classic_devices.insert(device_id);
-        }
-        if frame.record_class == 3 && frame.payload.len() == 64 && base == TALON_FD_BUNDLE_BASE {
-            fd_devices.insert(device_id);
-        }
+        discovery.observe(&frame);
     }
-
-    let all_devices = classic_devices
-        .union(&fd_devices)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut selection = CatalogSelection::default();
-    for device_id in all_devices {
-        let (transport, record_class, version) = if fd_devices.contains(&device_id) {
-            match versions.get(&(device_id, 3)) {
-                Some(version) => (PhoenixTransport::CanFd, 3, *version),
-                None => continue,
-            }
-        } else {
-            match versions.get(&(device_id, 1)) {
-                Some(version) => (PhoenixTransport::Can2, 1, *version),
-                None => continue,
-            }
-        };
-        let bytes = version.firmware_full.to_le_bytes();
-        let version_conflict = version_conflicts.contains(&(device_id, record_class));
-        let supported = bytes[3] == SUPPORTED_FIRMWARE_MAJOR && !version_conflict;
-        selection.devices.push(PhoenixDeviceInfo {
-            device_type: "TalonFX".to_owned(),
-            device_id,
-            firmware_major: bytes[3],
-            firmware_minor: bytes[2],
-            firmware_bugfix: bytes[1],
-            firmware_build: bytes[0],
-            firmware_full: version.firmware_full,
-            is_pro_licensed: version.is_pro_licensed,
-            transport,
-            version_conflict,
-            catalog_supported: supported,
-        });
-        if !supported {
-            continue;
-        }
-
-        let id = u32::from(device_id);
-        selection.frames.extend(
-            observed_status_frames
-                .iter()
-                .copied()
-                .filter(|key| key.arbitration_id & DEVICE_ID_MASK == id),
-        );
-        if transport == PhoenixTransport::CanFd {
-            selection.frames.insert(FrameKey {
-                arbitration_id: TALON_FD_BUNDLE_BASE | id,
-                record_class,
-                payload_len: 64,
-            });
-        }
-        selection.frames.insert(FrameKey {
-            arbitration_id: TALON_VERSION_BASE | id,
-            record_class,
-            payload_len: 6,
-        });
-        if transport == PhoenixTransport::CanFd && version_variants.contains(&(device_id, 1)) {
-            selection.frames.insert(FrameKey {
-                arbitration_id: TALON_VERSION_BASE | id,
-                record_class: 1,
-                payload_len: 6,
-            });
-        }
-    }
-    Ok(selection)
+    Ok(discovery.finish())
 }
 
 fn is_timesync_group_base(base: u32) -> bool {
@@ -606,11 +627,15 @@ pub(crate) fn classify(frame: &RawFrame, schema: &HootSchema) -> Option<CatalogF
         record_class: frame.record_class,
         payload_len: frame.payload.len(),
     };
+    classify_key(key, schema)
+}
+
+pub(crate) fn classify_key(key: FrameKey, schema: &HootSchema) -> Option<CatalogFrame> {
     if !schema.frame_enabled(key) {
         return None;
     }
-    let device_id = (frame.arbitration_id & DEVICE_ID_MASK) as u8;
-    let group = match frame.arbitration_id & FRAME_BASE_MASK {
+    let device_id = (key.arbitration_id & DEVICE_ID_MASK) as u8;
+    let group = match key.arbitration_id & FRAME_BASE_MASK {
         TALON_FD_BUNDLE_BASE => FrameGroup::FdBundle,
         TALON_MOTOR_OUTPUT_BASE => FrameGroup::MotorOutput,
         TALON_SUPPLY_TEMP_BASE => FrameGroup::SupplyTemp,
@@ -636,27 +661,33 @@ pub(crate) fn classify(frame: &RawFrame, schema: &HootSchema) -> Option<CatalogF
 
 pub(crate) fn add_schema(
     header: &HootHeader,
-    frame: &RawFrame,
+    definition_decoded_offset: u64,
     kind: CatalogFrame,
     schema: &mut HootSchema,
 ) {
-    add_device_bookkeeping(header, frame, kind.device_id, schema);
+    add_device_bookkeeping(header, definition_decoded_offset, kind.device_id, schema);
     for definitions in definitions(kind.group) {
         for definition in *definitions {
             insert_if_absent(
                 schema,
-                signal_info(header, frame, kind.device_id, definition),
+                signal_info(
+                    header,
+                    definition_decoded_offset,
+                    kind.device_id,
+                    definition,
+                ),
             );
         }
     }
 }
 
 impl CatalogDecoder {
-    pub(crate) fn decode_frame(
+    pub(crate) fn decode_frame_into(
         &mut self,
         frame: &RawFrame,
         kind: CatalogFrame,
-    ) -> Result<Vec<SignalUpdate>> {
+        updates: &mut std::collections::VecDeque<DecodedUpdate>,
+    ) -> Result<()> {
         let expected = match kind.group {
             FrameGroup::Version => 6,
             FrameGroup::FdBundle => 64,
@@ -671,7 +702,6 @@ impl CatalogDecoder {
             });
         }
 
-        let mut updates = Vec::new();
         let groups: &[(FrameGroup, usize)] = match kind.group {
             FrameGroup::FdBundle => &[
                 (FrameGroup::MotorOutput, 0),
@@ -708,32 +738,25 @@ impl CatalogDecoder {
             }
             for definitions in definitions(*group) {
                 for definition in *definitions {
-                    updates.push(update(
+                    updates.push_back(update(
                         frame,
                         phoenix_raw_id(definition.spn, kind.device_id),
-                        signal_name(kind.device_id, definition.leaf),
                         decode_value(definition.encoding, packed),
                     ));
                 }
             }
         }
-        updates.push(update(
+        updates.push_back(update(
             frame,
             timestamp_raw_id(kind.device_id),
-            signal_name(kind.device_id, "Timestamp"),
             SignalValue::Float64(frame.timestamp_us as f64 / 1_000_000.0),
         ));
-        Ok(updates)
+        Ok(())
     }
 }
 
-pub(crate) fn reset_update(frame: &RawFrame, device_id: u8) -> SignalUpdate {
-    update(
-        frame,
-        reset_count_raw_id(device_id),
-        signal_name(device_id, "ResetCount"),
-        SignalValue::Int64(0),
-    )
+pub(crate) fn reset_update(frame: &RawFrame, device_id: u8) -> DecodedUpdate {
+    update(frame, reset_count_raw_id(device_id), SignalValue::Int64(0))
 }
 
 impl CatalogFrame {
@@ -770,7 +793,7 @@ fn definitions(group: FrameGroup) -> &'static [&'static [SignalDef]] {
 
 fn signal_info(
     header: &HootHeader,
-    frame: &RawFrame,
+    definition_decoded_offset: u64,
     device_id: u8,
     definition: &SignalDef,
 ) -> SignalInfo {
@@ -790,7 +813,7 @@ fn signal_info(
         support: SignalSupport::Full,
         bus: header.source.clone(),
         device: Some(format!("TalonFX-{device_id}")),
-        definition_decoded_offset: frame.decoded_offset,
+        definition_decoded_offset,
     }
 }
 
@@ -953,7 +976,7 @@ fn motor_output_status(value: u8) -> &'static str {
 
 fn add_device_bookkeeping(
     header: &HootHeader,
-    frame: &RawFrame,
+    definition_decoded_offset: u64,
     device_id: u8,
     schema: &mut HootSchema,
 ) {
@@ -969,7 +992,7 @@ fn add_device_bookkeeping(
             support,
             bus: header.source.clone(),
             device: Some(format!("TalonFX-{device_id}")),
-            definition_decoded_offset: frame.decoded_offset,
+            definition_decoded_offset,
         };
     insert_if_absent(
         schema,
@@ -1001,11 +1024,10 @@ fn insert_if_absent(schema: &mut HootSchema, signal: SignalInfo) {
     }
 }
 
-fn update(frame: &RawFrame, raw_id: u32, name: String, value: SignalValue) -> SignalUpdate {
-    SignalUpdate {
+fn update(frame: &RawFrame, raw_id: u32, value: SignalValue) -> DecodedUpdate {
+    DecodedUpdate {
         timestamp_us: frame.timestamp_us,
         raw_id,
-        name,
         value,
         decoded_offset: frame.decoded_offset,
         compressed_byte_offset: frame.compressed_byte_offset,
@@ -1332,17 +1354,32 @@ mod tests {
             is_pro_licensed: true,
         };
         let mut decoder = CatalogDecoder::default();
+        let mut updates = std::collections::VecDeque::new();
         decoder
-            .decode_frame(&frame(TALON_FAULTS_BASE | 9, 3, "0000000000038002"), kind)
+            .decode_frame_into(
+                &frame(TALON_FAULTS_BASE | 9, 3, "0000000000038002"),
+                kind,
+                &mut updates,
+            )
             .unwrap();
-        let query = decoder
-            .decode_frame(&frame(TALON_FAULTS_BASE | 9, 1, "0000000000000000"), kind)
+        updates.clear();
+        decoder
+            .decode_frame_into(
+                &frame(TALON_FAULTS_BASE | 9, 1, "0000000000000000"),
+                kind,
+                &mut updates,
+            )
             .unwrap();
         let read = |leaf: &str| {
-            let name = signal_name(9, leaf);
-            &query
+            let raw_id = definitions(FrameGroup::Faults)
                 .iter()
-                .find(|update| update.name == name)
+                .flat_map(|definitions| definitions.iter())
+                .find(|definition| definition.leaf == leaf)
+                .map(|definition| phoenix_raw_id(definition.spn, 9))
+                .unwrap();
+            &updates
+                .iter()
+                .find(|update| update.raw_id == raw_id)
                 .unwrap()
                 .value
         };

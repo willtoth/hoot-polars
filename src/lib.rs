@@ -19,15 +19,17 @@ pub use model::{
     HootSchema, PhoenixDeviceInfo, PhoenixTransport, SchemaReport, SignalInfo, SignalSource,
     SignalSupport, SignalType, SignalUpdate, SignalValue, UnsupportedFrameInfo,
 };
-pub use polars_adapter::{HootParser, infer_schema};
+pub use polars_adapter::{HootParser, NarrowBatch, PreparedHoot, infer_schema};
 pub use repair::{TailRepair, TailRepairReport, canonicalize_tail};
 
 /// Reader configuration shared by raw and semantic passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
     pub tail_policy: TailPolicy,
-    /// Maximum permitted timestamp regression while producing ordered sparse
-    /// rows. The raw frame iterator is unaffected.
+    /// Minimum timestamp regression retained while producing ordered sparse
+    /// rows. Materializing APIs automatically widen this to the maximum
+    /// regression measured during schema discovery. The raw frame iterator is
+    /// unaffected.
     pub reorder_window_us: i64,
     /// Hard ceiling on unique timestamps retained by the reorder buffer.
     pub max_buffered_rows: usize,
@@ -49,6 +51,8 @@ pub struct HootReader<'a> {
     data: &'a [u8],
     header: HootHeader,
     options: DecodeOptions,
+    #[cfg(test)]
+    frame_iter_calls: std::cell::Cell<usize>,
 }
 
 impl<'a> HootReader<'a> {
@@ -65,6 +69,8 @@ impl<'a> HootReader<'a> {
             data,
             header,
             options,
+            #[cfg(test)]
+            frame_iter_calls: std::cell::Cell::new(0),
         })
     }
 
@@ -74,6 +80,9 @@ impl<'a> HootReader<'a> {
 
     /// Iterate entropy-decoded physical records without applying a catalog.
     pub fn frames(&self) -> FrameIter<'_> {
+        #[cfg(test)]
+        self.frame_iter_calls
+            .set(self.frame_iter_calls.get().saturating_add(1));
         FrameIter::new(
             &self.data[HEADER_LEN..],
             HEADER_LEN as u64,
@@ -81,9 +90,14 @@ impl<'a> HootReader<'a> {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn frame_iter_calls(&self) -> usize {
+        self.frame_iter_calls.get()
+    }
+
     /// Scan signal definitions and retain exact unsupported physical IDs.
     pub fn infer_schema(&self) -> Result<SchemaReport> {
-        semantic::infer_schema(&self.header, self.frames(), self.frames())
+        semantic::infer_schema(&self.header, self.frames())
     }
 
     /// Iterate sparse semantic updates for the supplied companion schema.
@@ -92,6 +106,13 @@ impl<'a> HootReader<'a> {
         schema: &'b HootSchema,
     ) -> impl Iterator<Item = Result<SignalUpdate>> + 'b {
         semantic::UpdateIter::new(self.frames(), schema)
+    }
+
+    pub(crate) fn decoded_updates<'b>(
+        &'b self,
+        schema: &'b HootSchema,
+    ) -> impl Iterator<Item = Result<model::DecodedUpdate>> + 'b {
+        semantic::DecodedUpdateIter::new(self.frames(), schema)
     }
 }
 
@@ -109,6 +130,27 @@ mod tests {
                 Err(HootError::TruncatedHeader { .. })
             ));
         }
+    }
+
+    #[test]
+    fn schema_then_updates_create_exactly_two_physical_traversals() {
+        let data = include_bytes!("../tests/fixtures/synthetic-two-double.hoot");
+        let reader = HootReader::with_options(
+            data,
+            DecodeOptions {
+                tail_policy: TailPolicy::Lenient,
+                ..DecodeOptions::default()
+            },
+        )
+        .unwrap();
+        let report = reader.infer_schema().unwrap();
+        assert_eq!(reader.frame_iter_calls(), 1);
+        let updates = reader
+            .updates(&report.schema)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(!updates.is_empty());
+        assert_eq!(reader.frame_iter_calls(), 2);
     }
 
     proptest! {
