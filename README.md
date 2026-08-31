@@ -25,14 +25,34 @@ HootParser::process_file_batched("robot.hoot", 5_000, |batch| {
     println!("{} rows", batch.height());
     Ok(())
 })?;
+
+// Keep pass-one schema work when inspection and conversion are separate steps.
+let prepared = HootParser::prepare_file("robot.hoot")?;
+println!("{} supported signals", prepared.report().schema.len());
+prepared.process_batched(5_000, |_batch| Ok(()))?;
+
+// Device-grouped batches avoid materializing every global signal column.
+prepared.process_narrow_batched(5_000, |batch| {
+    println!("{}: {} rows", batch.group, batch.frame.height());
+    Ok(())
+})?;
 # Ok::<(), hoot_polars::HootError>(())
 ```
 
 `HootParser` provides `from_bytes`, `from_file`, `infer_schema`, and bounded
 `process_file_batched` methods. Corresponding `*_selected` methods avoid
-allocating unused columns for narrow analyses. `HootReader` exposes checked
-headers, physical records, schema reports, raw identifiers and offsets, and a
-Polars-independent typed update iterator.
+allocating unused columns for narrow analyses. `prepare_file` returns a
+`PreparedHoot` that retains its memory map and schema report, so callers can
+inspect pass-one results and stream data in the second traversal without
+rediscovering the schema. `HootReader` exposes checked headers, physical
+records, schema reports, raw identifiers and offsets, and a Polars-independent
+typed update iterator.
+
+`PreparedHoot::process_narrow_batched` is intended for database ingestion. It
+groups Phoenix signals by device and custom signals together, and adds a
+`source_sequence: Int64` column derived from decoded source order. Consumers
+can combine the batches with a schema-unioning Parquet scan and use the sequence
+to deterministically collapse equal-timestamp rows after forward filling.
 
 The DataFrame contract is:
 
@@ -47,7 +67,9 @@ The DataFrame contract is:
 The facade defaults to lenient tail handling because a log may end before its
 final buffered record or entropy marker is flushed. `HootReader::new` remains
 strict. A bounded reorder buffer handles timestamp regressions; an update
-outside the configured window is an error.
+outside the effective window is an error. Materializing APIs use the larger of
+the configured minimum and the maximum regression measured during their schema
+pass, while `max_buffered_rows` remains the hard memory bound.
 
 ## CLI
 

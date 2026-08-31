@@ -45,7 +45,8 @@ enum Command {
         rows_per_batch: usize,
         #[arg(long, value_enum, default_value_t = TailMode::Lenient)]
         tail: TailMode,
-        /// Maximum timestamp disorder retained before emitting ordered rows.
+        /// Minimum timestamp disorder retained before emitting ordered rows.
+        /// Conversion widens this to the regression measured in the input.
         #[arg(long, default_value_t = 5_000_000)]
         reorder_window_us: i64,
         /// Hard ceiling for unique timestamp rows in the reorder buffer.

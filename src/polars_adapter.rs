@@ -1,18 +1,171 @@
 //! Sparse Polars conversion over the neutral native decoder.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, hash_map::Entry};
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use polars::prelude::{DataFrame, DataType, Field, NamedFrom, Schema, Series};
 
 use crate::error::{HootError, Result};
-use crate::model::{HootSchema, SignalInfo, SignalType, SignalUpdate, SignalValue};
-use crate::{DecodeOptions, HootReader, SchemaReport, TailPolicy};
+use crate::model::{DecodedUpdate, HootSchema, SignalInfo, SignalType, SignalValue};
+use crate::{DecodeOptions, HootHeader, HootReader, SchemaReport, TailPolicy};
 
 /// Compatibility facade for native HOOT-to-Polars conversion.
 pub struct HootParser;
+
+/// One physically narrow batch. Batches are grouped by device (with custom
+/// signals in their own group) and include `source_sequence` as a stable
+/// tie-breaker for equal timestamps.
+#[derive(Debug)]
+pub struct NarrowBatch {
+    pub group: String,
+    pub frame: DataFrame,
+}
+
+/// One prepared HOOT file that retains the schema-pass results for its later
+/// semantic streaming traversal.
+pub struct PreparedHoot {
+    mmap: Mmap,
+    options: DecodeOptions,
+    header: HootHeader,
+    report: SchemaReport,
+    #[cfg(test)]
+    frame_iter_calls: std::cell::Cell<usize>,
+}
+
+impl PreparedHoot {
+    fn open(path: &Path, options: DecodeOptions) -> Result<Self> {
+        let file = File::open(path)?;
+        // SAFETY: the map is read-only, owns the operating-system mapping for
+        // the lifetime of this object, and no mutable file handle is retained.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let reader = HootReader::with_options(&mmap, options)?;
+        let header = reader.header().clone();
+        let report = reader.infer_schema()?;
+        let options = options_for_report(options, &report)?;
+        #[cfg(test)]
+        let frame_iter_calls = std::cell::Cell::new(reader.frame_iter_calls());
+        Ok(Self {
+            mmap,
+            options,
+            header,
+            report,
+            #[cfg(test)]
+            frame_iter_calls,
+        })
+    }
+
+    /// Parsed fixed header retained from preparation.
+    pub fn header(&self) -> &HootHeader {
+        &self.header
+    }
+
+    /// Stable semantic schema and physical framing evidence from pass one.
+    pub fn report(&self) -> &SchemaReport {
+        &self.report
+    }
+
+    /// Stream every supported signal in bounded sparse row batches.
+    pub fn process_batched<F>(&self, rows_per_batch: usize, on_batch: F) -> Result<Schema>
+    where
+        F: FnMut(DataFrame) -> Result<()>,
+    {
+        self.process_batched_inner(rows_per_batch, None, on_batch)
+    }
+
+    /// Stream only the selected supported signals in bounded sparse batches.
+    pub fn process_batched_selected<F>(
+        &self,
+        rows_per_batch: usize,
+        signal_names: &[&str],
+        on_batch: F,
+    ) -> Result<Schema>
+    where
+        F: FnMut(DataFrame) -> Result<()>,
+    {
+        self.process_batched_inner(rows_per_batch, Some(signal_names), on_batch)
+    }
+
+    /// Stream device-grouped batches instead of allocating every signal for
+    /// every timestamp. The returned schema is the logical union of all
+    /// batches, including the internal `source_sequence` ordering column.
+    pub fn process_narrow_batched<F>(
+        &self,
+        rows_per_batch: usize,
+        mut on_batch: F,
+    ) -> Result<Schema>
+    where
+        F: FnMut(NarrowBatch) -> Result<()>,
+    {
+        if rows_per_batch == 0 {
+            return Err(HootError::InvalidArgument(
+                "rows_per_batch must be greater than zero".to_owned(),
+            ));
+        }
+        let reader = HootReader::with_options(&self.mmap, self.options)?;
+        let signals = supported_signals(&self.report.schema, None)?;
+        let logical_schema = narrow_polars_schema(&signals);
+        let result = stream_narrow_batches(
+            &reader,
+            &self.report.schema,
+            rows_per_batch,
+            self.options,
+            signals,
+            &mut on_batch,
+        );
+        #[cfg(test)]
+        self.frame_iter_calls.set(
+            self.frame_iter_calls
+                .get()
+                .saturating_add(reader.frame_iter_calls()),
+        );
+        result?;
+        Ok(logical_schema)
+    }
+
+    fn process_batched_inner<F>(
+        &self,
+        rows_per_batch: usize,
+        selection: Option<&[&str]>,
+        mut on_batch: F,
+    ) -> Result<Schema>
+    where
+        F: FnMut(DataFrame) -> Result<()>,
+    {
+        if rows_per_batch == 0 {
+            return Err(HootError::InvalidArgument(
+                "rows_per_batch must be greater than zero".to_owned(),
+            ));
+        }
+        let reader = HootReader::with_options(&self.mmap, self.options)?;
+        let signals = supported_signals(&self.report.schema, selection)?;
+        let polars_schema = polars_schema(&signals);
+        let result = stream_batches(
+            &reader,
+            &self.report.schema,
+            rows_per_batch,
+            self.options,
+            signals,
+            &mut on_batch,
+        );
+        #[cfg(test)]
+        self.frame_iter_calls.set(
+            self.frame_iter_calls
+                .get()
+                .saturating_add(reader.frame_iter_calls()),
+        );
+        result?;
+        Ok(polars_schema)
+    }
+
+    #[cfg(test)]
+    fn frame_iter_calls(&self) -> usize {
+        self.frame_iter_calls.get()
+    }
+}
 
 impl HootParser {
     /// Decode an owned HOOT buffer using documented lenient tail recovery.
@@ -24,6 +177,7 @@ impl HootParser {
     pub fn from_bytes_with_options(data: &[u8], options: DecodeOptions) -> Result<DataFrame> {
         let reader = HootReader::with_options(data, options)?;
         let report = reader.infer_schema()?;
+        let options = options_for_report(options, &report)?;
         dataframe_from_reader(&reader, &report.schema, options, None)
     }
 
@@ -42,6 +196,7 @@ impl HootParser {
     ) -> Result<DataFrame> {
         let reader = HootReader::with_options(data, options)?;
         let report = reader.infer_schema()?;
+        let options = options_for_report(options, &report)?;
         dataframe_from_reader(&reader, &report.schema, options, Some(signal_names))
     }
 
@@ -69,6 +224,21 @@ impl HootParser {
         // and `file` is kept alive until all decoder borrows have ended.
         let mmap = unsafe { Mmap::map(&file)? };
         Self::from_bytes_selected_with_options(&mmap, signal_names, facade_options())
+    }
+
+    /// Prepare a memory-mapped file with the normal lenient tail policy.
+    pub fn prepare_file<P: AsRef<Path>>(path: P) -> Result<PreparedHoot> {
+        Self::prepare_file_with_options(path, facade_options())
+    }
+
+    /// Prepare a memory-mapped file with explicit reader options. Preparation
+    /// performs the schema/framing pass; `PreparedHoot::process_batched` then
+    /// performs the semantic data pass without rediscovering that schema.
+    pub fn prepare_file_with_options<P: AsRef<Path>>(
+        path: P,
+        options: DecodeOptions,
+    ) -> Result<PreparedHoot> {
+        PreparedHoot::open(path.as_ref(), options)
     }
 
     /// Infer the companion schema and retain unsupported-frame evidence.
@@ -163,20 +333,35 @@ fn facade_options() -> DecodeOptions {
     }
 }
 
+fn options_for_report(options: DecodeOptions, report: &SchemaReport) -> Result<DecodeOptions> {
+    if options.reorder_window_us < 0 {
+        return Err(HootError::InvalidArgument(
+            "reorder_window_us cannot be negative".to_owned(),
+        ));
+    }
+    let observed_reorder_window_us = i64::try_from(report.max_out_of_order_us).map_err(|_| {
+        HootError::InvalidArgument(
+            "observed timestamp regression exceeds signed 64-bit range".to_owned(),
+        )
+    })?;
+    Ok(DecodeOptions {
+        reorder_window_us: options.reorder_window_us.max(observed_reorder_window_us),
+        ..options
+    })
+}
+
 fn dataframe_from_reader(
     reader: &HootReader<'_>,
     schema: &HootSchema,
     options: DecodeOptions,
     selection: Option<&[&str]>,
 ) -> Result<DataFrame> {
-    let signals = supported_signals(schema, selection)?;
+    let signals: Arc<[SignalInfo]> = supported_signals(schema, selection)?.into();
     let mut reorder = ReorderBuffer::new(&signals, options)?;
-    let mut rows = SparseBatch::new(signals, 4096);
-    for update in reader.updates(schema) {
+    let mut rows = SparseBatch::new(Arc::clone(&signals), 4096);
+    for update in reader.decoded_updates(schema) {
         let update = update?;
-        if reorder.contains(update.raw_id) {
-            reorder.accept(update)?;
-        }
+        reorder.accept(update)?;
         while let Some((timestamp, values)) = reorder.pop_ready(false) {
             rows.push_row(timestamp, values);
         }
@@ -193,7 +378,7 @@ fn process_file_batched_inner<F>(
     rows_per_batch: usize,
     options: DecodeOptions,
     selection: Option<&[&str]>,
-    mut on_batch: F,
+    on_batch: F,
 ) -> Result<Schema>
 where
     F: FnMut(DataFrame) -> Result<()>,
@@ -203,23 +388,8 @@ where
             "rows_per_batch must be greater than zero".to_owned(),
         ));
     }
-    let file = File::open(path)?;
-    // SAFETY: this is a read-only map, `file` outlives it, and neither the
-    // callback nor returned schema can retain a borrow into the mapping.
-    let mmap = unsafe { Mmap::map(&file)? };
-    let reader = HootReader::with_options(&mmap, options)?;
-    let report = reader.infer_schema()?;
-    let signals = supported_signals(&report.schema, selection)?;
-    let polars_schema = polars_schema(&signals);
-    stream_batches(
-        &reader,
-        &report.schema,
-        rows_per_batch,
-        options,
-        signals,
-        &mut on_batch,
-    )?;
-    Ok(polars_schema)
+    let prepared = PreparedHoot::open(path, options)?;
+    prepared.process_batched_inner(rows_per_batch, selection, on_batch)
 }
 
 fn stream_batches<F>(
@@ -233,19 +403,20 @@ fn stream_batches<F>(
 where
     F: FnMut(DataFrame) -> Result<()>,
 {
+    let signals: Arc<[SignalInfo]> = signals.into();
     let mut reorder = ReorderBuffer::new(&signals, options)?;
-    let mut rows = SparseBatch::new(signals.clone(), rows_per_batch);
-    for update in reader.updates(_schema) {
+    let mut rows = SparseBatch::new(Arc::clone(&signals), rows_per_batch);
+    for update in reader.decoded_updates(_schema) {
         let update = update?;
-        if reorder.contains(update.raw_id) {
-            reorder.accept(update)?;
-        }
+        reorder.accept(update)?;
         while let Some((timestamp, values)) = reorder.pop_ready(false) {
             rows.push_row(timestamp, values);
             if rows.len() == rows_per_batch {
-                let batch =
-                    std::mem::replace(&mut rows, SparseBatch::new(signals.clone(), rows_per_batch))
-                        .build()?;
+                let batch = std::mem::replace(
+                    &mut rows,
+                    SparseBatch::new(Arc::clone(&signals), rows_per_batch),
+                )
+                .build()?;
                 on_batch(batch)?;
             }
         }
@@ -254,9 +425,11 @@ where
     while let Some((timestamp, values)) = reorder.pop_ready(true) {
         rows.push_row(timestamp, values);
         if rows.len() == rows_per_batch {
-            let batch =
-                std::mem::replace(&mut rows, SparseBatch::new(signals.clone(), rows_per_batch))
-                    .build()?;
+            let batch = std::mem::replace(
+                &mut rows,
+                SparseBatch::new(Arc::clone(&signals), rows_per_batch),
+            )
+            .build()?;
             on_batch(batch)?;
         }
     }
@@ -266,9 +439,322 @@ where
     Ok(())
 }
 
+fn stream_narrow_batches<F>(
+    reader: &HootReader<'_>,
+    schema: &HootSchema,
+    rows_per_batch: usize,
+    options: DecodeOptions,
+    signals: Vec<SignalInfo>,
+    on_batch: &mut F,
+) -> Result<()>
+where
+    F: FnMut(NarrowBatch) -> Result<()>,
+{
+    let groups = NarrowGroups::new(signals);
+    let mut reorder = NarrowReorderBuffer::new(&groups, options)?;
+    let mut batches = groups
+        .groups
+        .iter()
+        .map(|group| NarrowSparseBatch::new(Arc::clone(&group.signals), rows_per_batch))
+        .collect::<Vec<_>>();
+
+    for update in reader.decoded_updates(schema) {
+        reorder.accept(update?)?;
+        while let Some(row) = reorder.pop_ready(false) {
+            push_narrow_row(&groups, &mut batches, rows_per_batch, row, on_batch)?;
+        }
+        reorder.check_limit()?;
+    }
+    while let Some(row) = reorder.pop_ready(true) {
+        push_narrow_row(&groups, &mut batches, rows_per_batch, row, on_batch)?;
+    }
+    for (group_index, rows) in batches.into_iter().enumerate() {
+        if !rows.is_empty() {
+            on_batch(NarrowBatch {
+                group: groups.groups[group_index].key.clone(),
+                frame: rows.build()?,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn push_narrow_row<F>(
+    groups: &NarrowGroups,
+    batches: &mut [NarrowSparseBatch],
+    rows_per_batch: usize,
+    row: NarrowRow,
+    on_batch: &mut F,
+) -> Result<()>
+where
+    F: FnMut(NarrowBatch) -> Result<()>,
+{
+    let group = &groups.groups[row.group_index];
+    let rows = &mut batches[row.group_index];
+    rows.push_row(row.timestamp, row.source_sequence, row.values);
+    if rows.len() == rows_per_batch {
+        let frame = std::mem::replace(
+            rows,
+            NarrowSparseBatch::new(Arc::clone(&group.signals), rows_per_batch),
+        )
+        .build()?;
+        on_batch(NarrowBatch {
+            group: group.key.clone(),
+            frame,
+        })?;
+    }
+    Ok(())
+}
+
+struct NarrowGroup {
+    key: String,
+    signals: Arc<[SignalInfo]>,
+}
+
+struct NarrowGroups {
+    groups: Vec<NarrowGroup>,
+    index: HashMap<u32, (usize, usize)>,
+}
+
+impl NarrowGroups {
+    fn new(signals: Vec<SignalInfo>) -> Self {
+        let mut grouped = BTreeMap::<String, Vec<SignalInfo>>::new();
+        for signal in signals {
+            let key = signal
+                .device
+                .as_ref()
+                .map_or_else(|| "custom".to_owned(), |device| format!("device/{device}"));
+            grouped.entry(key).or_default().push(signal);
+        }
+        let groups = grouped
+            .into_iter()
+            .map(|(key, signals)| NarrowGroup {
+                key,
+                signals: signals.into(),
+            })
+            .collect::<Vec<_>>();
+        let index = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(group_index, group)| {
+                group
+                    .signals
+                    .iter()
+                    .enumerate()
+                    .map(move |(column_index, signal)| (signal.raw_id, (group_index, column_index)))
+            })
+            .collect();
+        Self { groups, index }
+    }
+}
+
+struct NarrowSparseBatch {
+    signals: Arc<[SignalInfo]>,
+    timestamps: Vec<i64>,
+    source_sequences: Vec<i64>,
+    columns: Vec<Vec<Option<SignalValue>>>,
+}
+
+impl NarrowSparseBatch {
+    fn new(signals: Arc<[SignalInfo]>, capacity: usize) -> Self {
+        let initial_capacity = capacity.min(1_024);
+        let columns = (0..signals.len())
+            .map(|_| Vec::with_capacity(initial_capacity))
+            .collect();
+        Self {
+            signals,
+            timestamps: Vec::with_capacity(initial_capacity),
+            source_sequences: Vec::with_capacity(initial_capacity),
+            columns,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.timestamps.is_empty()
+    }
+
+    fn push_row(
+        &mut self,
+        timestamp: i64,
+        source_sequence: i64,
+        mut values: Vec<Option<SignalValue>>,
+    ) {
+        debug_assert_eq!(values.len(), self.columns.len());
+        self.timestamps.push(timestamp);
+        self.source_sequences.push(source_sequence);
+        for (column, value) in self.columns.iter_mut().zip(&mut values) {
+            column.push(value.take());
+        }
+    }
+
+    fn build(self) -> Result<DataFrame> {
+        let mut columns = Vec::with_capacity(self.signals.len() + 2);
+        columns.push(Series::new("timestamp".into(), self.timestamps).into());
+        columns.push(Series::new("source_sequence".into(), self.source_sequences).into());
+        for (signal, values) in self.signals.iter().zip(self.columns) {
+            columns.push(build_series(signal, values)?.into());
+        }
+        Ok(DataFrame::new(columns)?)
+    }
+}
+
+struct NarrowPendingRow {
+    source_sequence: i64,
+    values: Vec<Option<SignalValue>>,
+}
+
+struct NarrowRow {
+    timestamp: i64,
+    source_sequence: i64,
+    group_index: usize,
+    values: Vec<Option<SignalValue>>,
+}
+
+struct NarrowReorderBuffer {
+    index: HashMap<u32, (usize, usize)>,
+    column_counts: Vec<usize>,
+    pending: HashMap<(i64, usize), NarrowPendingRow>,
+    rows: BinaryHeap<Reverse<(i64, usize)>>,
+    timestamp_counts: HashMap<i64, usize>,
+    max_timestamp: Option<i64>,
+    emitted_through: Option<i64>,
+    reorder_window_us: i64,
+    max_buffered_rows: usize,
+}
+
+impl NarrowReorderBuffer {
+    fn new(groups: &NarrowGroups, options: DecodeOptions) -> Result<Self> {
+        if options.reorder_window_us < 0 {
+            return Err(HootError::InvalidArgument(
+                "reorder_window_us cannot be negative".to_owned(),
+            ));
+        }
+        if options.max_buffered_rows == 0 {
+            return Err(HootError::InvalidArgument(
+                "max_buffered_rows must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            index: groups.index.clone(),
+            column_counts: groups
+                .groups
+                .iter()
+                .map(|group| group.signals.len())
+                .collect(),
+            pending: HashMap::new(),
+            rows: BinaryHeap::new(),
+            timestamp_counts: HashMap::new(),
+            max_timestamp: None,
+            emitted_through: None,
+            reorder_window_us: options.reorder_window_us,
+            max_buffered_rows: options.max_buffered_rows,
+        })
+    }
+
+    fn accept(&mut self, update: DecodedUpdate) -> Result<()> {
+        let Some((group_index, column_index)) = self.index.get(&update.raw_id).copied() else {
+            return Ok(());
+        };
+        if let Some(emitted) = self.emitted_through
+            && update.timestamp_us <= emitted
+        {
+            return Err(HootError::LateTimestamp {
+                timestamp_us: update.timestamp_us,
+                emitted_through_us: emitted,
+                decoded_offset: update.decoded_offset,
+                reorder_window_us: self.reorder_window_us,
+            });
+        }
+        let source_sequence = i64::try_from(update.decoded_offset).map_err(|_| {
+            HootError::InvalidArgument("decoded offset exceeds signed 64-bit range".to_owned())
+        })?;
+        self.max_timestamp = Some(self.max_timestamp.map_or(update.timestamp_us, |maximum| {
+            maximum.max(update.timestamp_us)
+        }));
+        let key = (update.timestamp_us, group_index);
+        let row = match self.pending.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                self.rows.push(Reverse(key));
+                *self
+                    .timestamp_counts
+                    .entry(update.timestamp_us)
+                    .or_default() += 1;
+                entry.insert(NarrowPendingRow {
+                    source_sequence,
+                    values: (0..self.column_counts[group_index]).map(|_| None).collect(),
+                })
+            }
+        };
+        row.source_sequence = row.source_sequence.max(source_sequence);
+        row.values[column_index] = Some(update.value);
+        Ok(())
+    }
+
+    fn pop_ready(&mut self, force: bool) -> Option<NarrowRow> {
+        let (timestamp, group_index) = self.rows.peek()?.0;
+        let ready = force
+            || self
+                .max_timestamp
+                .is_some_and(|maximum| maximum.saturating_sub(timestamp) > self.reorder_window_us);
+        if !ready {
+            return None;
+        }
+        self.rows.pop();
+        let row = self
+            .pending
+            .remove(&(timestamp, group_index))
+            .expect("narrow timestamp heap and pending map remain synchronized");
+        match self.timestamp_counts.entry(timestamp) {
+            Entry::Occupied(mut entry) if *entry.get() > 1 => *entry.get_mut() -= 1,
+            Entry::Occupied(entry) => {
+                entry.remove();
+            }
+            Entry::Vacant(_) => unreachable!("pending timestamp count remains synchronized"),
+        }
+        self.emitted_through = Some(timestamp);
+        Some(NarrowRow {
+            timestamp,
+            source_sequence: row.source_sequence,
+            group_index,
+            values: row.values,
+        })
+    }
+
+    fn check_limit(&self) -> Result<()> {
+        if self.timestamp_counts.len() > self.max_buffered_rows {
+            return Err(HootError::ReorderBufferLimit {
+                timestamp_us: self.max_timestamp.unwrap_or_default(),
+                limit: self.max_buffered_rows,
+            });
+        }
+        Ok(())
+    }
+}
+
 fn polars_schema(signals: &[SignalInfo]) -> Schema {
     let mut fields = Vec::with_capacity(signals.len() + 1);
     fields.push(Field::new("timestamp".into(), DataType::Int64));
+    fields.extend(signals.iter().map(|signal| {
+        Field::new(
+            signal.name.as_str().into(),
+            signal
+                .signal_type
+                .polars_type()
+                .expect("supported_signals filters unknown types"),
+        )
+    }));
+    Schema::from_iter(fields)
+}
+
+fn narrow_polars_schema(signals: &[SignalInfo]) -> Schema {
+    let mut fields = Vec::with_capacity(signals.len() + 2);
+    fields.push(Field::new("timestamp".into(), DataType::Int64));
+    fields.push(Field::new("source_sequence".into(), DataType::Int64));
     fields.extend(signals.iter().map(|signal| {
         Field::new(
             signal.name.as_str().into(),
@@ -303,10 +789,10 @@ fn supported_signals(schema: &HootSchema, selection: Option<&[&str]>) -> Result<
                 signal.raw_id, signal.name, signal.original_type
             )));
         }
-        if signal.name == "timestamp" {
+        if matches!(signal.name.as_str(), "timestamp" | "source_sequence") {
             return Err(HootError::Schema(format!(
-                "signal 0x{:x} uses reserved column name timestamp",
-                signal.raw_id
+                "signal 0x{:x} uses reserved column name {}",
+                signal.raw_id, signal.name
             )));
         }
         if !names.insert(signal.name.clone()) {
@@ -333,13 +819,13 @@ fn supported_signals(schema: &HootSchema, selection: Option<&[&str]>) -> Result<
 }
 
 struct SparseBatch {
-    signals: Vec<SignalInfo>,
+    signals: Arc<[SignalInfo]>,
     timestamps: Vec<i64>,
     columns: Vec<Vec<Option<SignalValue>>>,
 }
 
 impl SparseBatch {
-    fn new(signals: Vec<SignalInfo>, capacity: usize) -> Self {
+    fn new(signals: Arc<[SignalInfo]>, capacity: usize) -> Self {
         let columns = (0..signals.len())
             .map(|_| Vec::with_capacity(capacity))
             .collect();
@@ -369,8 +855,8 @@ impl SparseBatch {
     fn build(self) -> Result<DataFrame> {
         let mut columns = Vec::with_capacity(self.signals.len() + 1);
         columns.push(Series::new("timestamp".into(), self.timestamps).into());
-        for (signal, values) in self.signals.into_iter().zip(self.columns) {
-            columns.push(build_series(&signal, values)?.into());
+        for (signal, values) in self.signals.iter().zip(self.columns) {
+            columns.push(build_series(signal, values)?.into());
         }
         Ok(DataFrame::new(columns)?)
     }
@@ -379,7 +865,8 @@ impl SparseBatch {
 struct ReorderBuffer {
     index: HashMap<u32, usize>,
     column_count: usize,
-    pending: BTreeMap<i64, Vec<Option<SignalValue>>>,
+    pending: HashMap<i64, Vec<Option<SignalValue>>>,
+    timestamps: BinaryHeap<Reverse<i64>>,
     max_timestamp: Option<i64>,
     emitted_through: Option<i64>,
     reorder_window_us: i64,
@@ -405,7 +892,8 @@ impl ReorderBuffer {
                 .map(|(index, signal)| (signal.raw_id, index))
                 .collect(),
             column_count: signals.len(),
-            pending: BTreeMap::new(),
+            pending: HashMap::new(),
+            timestamps: BinaryHeap::new(),
             max_timestamp: None,
             emitted_through: None,
             reorder_window_us: options.reorder_window_us,
@@ -413,7 +901,10 @@ impl ReorderBuffer {
         })
     }
 
-    fn accept(&mut self, update: SignalUpdate) -> Result<()> {
+    fn accept(&mut self, update: DecodedUpdate) -> Result<()> {
+        let Some(index) = self.index.get(&update.raw_id).copied() else {
+            return Ok(());
+        };
         if let Some(emitted) = self.emitted_through
             && update.timestamp_us <= emitted
         {
@@ -427,26 +918,19 @@ impl ReorderBuffer {
         self.max_timestamp = Some(self.max_timestamp.map_or(update.timestamp_us, |maximum| {
             maximum.max(update.timestamp_us)
         }));
-        let index = self.index.get(&update.raw_id).copied().ok_or_else(|| {
-            HootError::Schema(format!(
-                "update for signal 0x{:x} ({}) is absent from the inferred schema",
-                update.raw_id, update.name
-            ))
-        })?;
-        let values = self
-            .pending
-            .entry(update.timestamp_us)
-            .or_insert_with(|| vec![None; self.column_count]);
+        let values = match self.pending.entry(update.timestamp_us) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                self.timestamps.push(Reverse(update.timestamp_us));
+                entry.insert(vec![None; self.column_count])
+            }
+        };
         values[index] = Some(update.value);
         Ok(())
     }
 
-    fn contains(&self, raw_id: u32) -> bool {
-        self.index.contains_key(&raw_id)
-    }
-
     fn pop_ready(&mut self, force: bool) -> Option<(i64, Vec<Option<SignalValue>>)> {
-        let timestamp = *self.pending.first_key_value()?.0;
+        let timestamp = self.timestamps.peek()?.0;
         let ready = force
             || self
                 .max_timestamp
@@ -454,9 +938,13 @@ impl ReorderBuffer {
         if !ready {
             return None;
         }
-        let row = self.pending.pop_first()?;
-        self.emitted_through = Some(row.0);
-        Some(row)
+        self.timestamps.pop();
+        let values = self
+            .pending
+            .remove(&timestamp)
+            .expect("timestamp heap and pending map remain synchronized");
+        self.emitted_through = Some(timestamp);
+        Some((timestamp, values))
     }
 
     fn check_limit(&self) -> Result<()> {
@@ -648,6 +1136,67 @@ mod tests {
     }
 
     #[test]
+    fn prepared_file_reuses_its_schema_for_streaming() {
+        let data = controlled_two_double_file();
+        let full = HootParser::from_bytes(data.clone()).unwrap();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), data).unwrap();
+
+        let prepared = HootParser::prepare_file(input.path()).unwrap();
+        assert_eq!(prepared.header().source, "Simulation");
+        assert_eq!(prepared.report().schema.len(), 1);
+        assert_eq!(prepared.frame_iter_calls(), 1);
+        let mut batches = Vec::new();
+        let schema = prepared
+            .process_batched(1, |batch| {
+                batches.push(batch);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(prepared.frame_iter_calls(), 2);
+        assert_eq!(&schema, full.schema().as_ref());
+        let mut streamed = batches.remove(0);
+        for batch in batches {
+            streamed.vstack_mut(&batch).unwrap();
+        }
+        assert!(streamed.equals_missing(&full));
+    }
+
+    #[test]
+    fn prepared_file_streams_narrow_batches_with_source_order() {
+        let data = controlled_two_double_file();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), data).unwrap();
+
+        let prepared = HootParser::prepare_file(input.path()).unwrap();
+        let mut batches = Vec::new();
+        let schema = prepared
+            .process_narrow_batched(1, |batch| {
+                assert_eq!(batch.group, "custom");
+                batches.push(batch.frame);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            schema
+                .iter_names()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>(),
+            ["timestamp", "source_sequence", "x"]
+        );
+        assert_eq!(batches.len(), 2);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .column("source_sequence")
+                .unwrap()
+                .i64()
+                .unwrap()
+                .get(0)
+                .is_some_and(|sequence| sequence > 0)
+        }));
+    }
+
+    #[test]
     fn selected_projection_is_narrow_and_validated() {
         let data = controlled_two_double_file();
         let selected = HootParser::from_bytes_selected(data.clone(), &["x"]).unwrap();
@@ -674,6 +1223,81 @@ mod tests {
     }
 
     #[test]
+    fn materializing_options_cover_the_regression_measured_in_pass_one() {
+        let report = SchemaReport {
+            max_out_of_order_us: 400,
+            ..SchemaReport::default()
+        };
+        let adjusted = options_for_report(
+            DecodeOptions {
+                reorder_window_us: 100,
+                ..DecodeOptions::default()
+            },
+            &report,
+        )
+        .unwrap();
+        assert_eq!(adjusted.reorder_window_us, 400);
+
+        let configured_larger = options_for_report(
+            DecodeOptions {
+                reorder_window_us: 1_000,
+                ..DecodeOptions::default()
+            },
+            &report,
+        )
+        .unwrap();
+        assert_eq!(configured_larger.reorder_window_us, 1_000);
+
+        let signal = SignalInfo {
+            raw_id: 1,
+            name: "value".to_owned(),
+            signal_type: SignalType::Int64,
+            original_type: "int64".to_owned(),
+            units: String::new(),
+            metadata: "{}".to_owned(),
+            source: crate::model::SignalSource::PhoenixCan,
+            support: crate::model::SignalSupport::Full,
+            bus: "Simulation".to_owned(),
+            device: Some("device".to_owned()),
+            definition_decoded_offset: 0,
+        };
+        let groups = NarrowGroups::new(vec![signal]);
+        let mut reorder = NarrowReorderBuffer::new(&groups, adjusted).unwrap();
+        let mut ordered = Vec::new();
+        for (timestamp_us, decoded_offset) in [(300, 10), (500, 20), (100, 30)] {
+            reorder
+                .accept(DecodedUpdate {
+                    timestamp_us,
+                    raw_id: 1,
+                    value: SignalValue::Int64(timestamp_us),
+                    decoded_offset,
+                    compressed_byte_offset: 80,
+                })
+                .unwrap();
+            while let Some(row) = reorder.pop_ready(false) {
+                ordered.push(row.timestamp);
+            }
+        }
+        while let Some(row) = reorder.pop_ready(true) {
+            ordered.push(row.timestamp);
+        }
+        assert_eq!(ordered, [100, 300, 500]);
+    }
+
+    #[test]
+    fn adaptive_reordering_does_not_hide_invalid_negative_options() {
+        let error = options_for_report(
+            DecodeOptions {
+                reorder_window_us: -1,
+                ..DecodeOptions::default()
+            },
+            &SchemaReport::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, HootError::InvalidArgument(_)));
+    }
+
+    #[test]
     fn row_builder_is_sparse_sorted_and_last_update_wins() {
         let signals = vec![SignalInfo {
             raw_id: 7,
@@ -696,13 +1320,12 @@ mod tests {
             },
         )
         .unwrap();
-        let mut batch = SparseBatch::new(signals, 2);
+        let mut batch = SparseBatch::new(signals.into(), 2);
         for (timestamp_us, value) in [(20, 3), (10, 1), (10, 2)] {
             reorder
-                .accept(SignalUpdate {
+                .accept(DecodedUpdate {
                     timestamp_us,
                     raw_id: 7,
-                    name: "x".to_owned(),
                     value: SignalValue::Int64(value),
                     decoded_offset: 0,
                     compressed_byte_offset: 80,
@@ -715,5 +1338,48 @@ mod tests {
         let frame = batch.build().unwrap();
         assert_eq!(frame.height(), 2);
         assert_eq!(frame.column("x").unwrap().i64().unwrap().get(0), Some(2));
+    }
+
+    #[test]
+    fn narrow_reorder_separates_devices_and_orders_equal_timestamps() {
+        let signal = |raw_id, device: &str| SignalInfo {
+            raw_id,
+            name: format!("{device}_value"),
+            signal_type: SignalType::Int64,
+            original_type: "int64".to_owned(),
+            units: String::new(),
+            metadata: "{}".to_owned(),
+            source: crate::model::SignalSource::PhoenixCan,
+            support: crate::model::SignalSupport::Full,
+            bus: "Simulation".to_owned(),
+            device: Some(device.to_owned()),
+            definition_decoded_offset: 0,
+        };
+        let groups = NarrowGroups::new(vec![signal(1, "a"), signal(2, "b")]);
+        assert_eq!(groups.groups.len(), 2);
+        let mut reorder = NarrowReorderBuffer::new(
+            &groups,
+            DecodeOptions {
+                reorder_window_us: 100,
+                ..DecodeOptions::default()
+            },
+        )
+        .unwrap();
+        for (raw_id, decoded_offset) in [(2, 20), (1, 10)] {
+            reorder
+                .accept(DecodedUpdate {
+                    timestamp_us: 50,
+                    raw_id,
+                    value: SignalValue::Int64(i64::from(raw_id)),
+                    decoded_offset,
+                    compressed_byte_offset: 80,
+                })
+                .unwrap();
+        }
+        let rows = std::iter::from_fn(|| reorder.pop_ready(true)).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, 50);
+        assert_eq!(rows[0].source_sequence, 10);
+        assert_eq!(rows[1].source_sequence, 20);
     }
 }
