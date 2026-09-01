@@ -37,40 +37,31 @@ pub(crate) fn infer_schema(header: &HootHeader, mut frames: FrameIter<'_>) -> Re
         let frame = frame?;
         discovery.observe(&frame);
         raw_frames += 1;
-        min_timestamp_us = Some(min_timestamp_us.map_or(frame.timestamp_us, |minimum: i64| {
-            minimum.min(frame.timestamp_us)
-        }));
-        if let Some(maximum) = max_timestamp_us {
-            if frame.timestamp_us < maximum {
-                out_of_order_frames += 1;
-                max_out_of_order_us =
-                    max_out_of_order_us.max((maximum - frame.timestamp_us) as u64);
-            }
-            max_timestamp_us = Some(maximum.max(frame.timestamp_us));
-        } else {
-            max_timestamp_us = Some(frame.timestamp_us);
-        }
         if frame.record_class == CUSTOM_CLASS {
             custom_frames += 1;
-            apply_custom_definition(header, &frame, &mut schema)?;
-        } else {
-            let key = FrameKey {
-                arbitration_id: frame.arbitration_id,
-                record_class: frame.record_class,
-                payload_len: frame.payload.len(),
-            };
-            let info = observed.entry(key).or_insert(UnsupportedFrameInfo {
-                arbitration_id: frame.arbitration_id,
-                record_class: frame.record_class,
-                payload_len: frame.payload.len(),
-                count: 0,
-                first_decoded_offset: frame.decoded_offset,
-                first_compressed_byte_offset: frame.compressed_byte_offset,
-                first_payload: frame.payload.clone(),
-                first_payload_delta: frame.payload_delta.clone(),
-            });
-            info.count += 1;
+            if let Some(custom) = parse_known_custom_header(&frame)? {
+                if custom.subtype == CUSTOM_DATA {
+                    observe_timestamp_order(
+                        frame.timestamp_us,
+                        &mut min_timestamp_us,
+                        &mut max_timestamp_us,
+                        &mut out_of_order_frames,
+                        &mut max_out_of_order_us,
+                    );
+                }
+                apply_custom_definition(header, &frame, custom, &mut schema)?;
+                continue;
+            }
+        } else if catalog::is_update_candidate(&frame) {
+            observe_timestamp_order(
+                frame.timestamp_us,
+                &mut min_timestamp_us,
+                &mut max_timestamp_us,
+                &mut out_of_order_frames,
+                &mut max_out_of_order_us,
+            );
         }
+        observe_physical_frame(&mut observed, &frame);
     }
 
     let recovered_tail = frames.tail_recovery().cloned();
@@ -102,12 +93,54 @@ pub(crate) fn infer_schema(header: &HootHeader, mut frames: FrameIter<'_>) -> Re
     })
 }
 
+fn observe_timestamp_order(
+    timestamp_us: i64,
+    min_timestamp_us: &mut Option<i64>,
+    max_timestamp_us: &mut Option<i64>,
+    out_of_order_frames: &mut u64,
+    max_out_of_order_us: &mut u64,
+) {
+    *min_timestamp_us =
+        Some(min_timestamp_us.map_or(timestamp_us, |minimum| minimum.min(timestamp_us)));
+    if let Some(maximum) = *max_timestamp_us {
+        if timestamp_us < maximum {
+            *out_of_order_frames += 1;
+            *max_out_of_order_us = (*max_out_of_order_us).max((maximum - timestamp_us) as u64);
+        }
+        *max_timestamp_us = Some(maximum.max(timestamp_us));
+    } else {
+        *max_timestamp_us = Some(timestamp_us);
+    }
+}
+
+fn observe_physical_frame(
+    observed: &mut BTreeMap<FrameKey, UnsupportedFrameInfo>,
+    frame: &RawFrame,
+) {
+    let key = FrameKey {
+        arbitration_id: frame.arbitration_id,
+        record_class: frame.record_class,
+        payload_len: frame.payload.len(),
+    };
+    let info = observed.entry(key).or_insert(UnsupportedFrameInfo {
+        arbitration_id: frame.arbitration_id,
+        record_class: frame.record_class,
+        payload_len: frame.payload.len(),
+        count: 0,
+        first_decoded_offset: frame.decoded_offset,
+        first_compressed_byte_offset: frame.compressed_byte_offset,
+        first_payload: frame.payload.clone(),
+        first_payload_delta: frame.payload_delta.clone(),
+    });
+    info.count += 1;
+}
+
 fn apply_custom_definition(
     file_header: &HootHeader,
     frame: &RawFrame,
+    custom: CustomHeader,
     schema: &mut HootSchema,
 ) -> Result<()> {
-    let custom = parse_custom_header(frame)?;
     let payload = exact_payload(frame, custom)?;
     match custom.subtype {
         CUSTOM_NAME => {
@@ -189,8 +222,9 @@ impl Iterator for DecodedUpdateIter<'_> {
             if frame.record_class != CUSTOM_CLASS {
                 continue;
             }
-            let custom = match parse_custom_header(&frame) {
-                Ok(custom) => custom,
+            let custom = match parse_known_custom_header(&frame) {
+                Ok(Some(custom)) => custom,
+                Ok(None) => continue,
                 Err(error) => return Some(Err(error)),
             };
             if custom.subtype != CUSTOM_DATA {
@@ -262,13 +296,13 @@ impl Iterator for UpdateIter<'_> {
     }
 }
 
-fn parse_custom_header(frame: &RawFrame) -> Result<CustomHeader> {
+fn parse_known_custom_header(frame: &RawFrame) -> Result<Option<CustomHeader>> {
     if frame.record_class != CUSTOM_CLASS {
-        return Err(HootError::InvalidCustomDescriptor {
-            decoded_offset: frame.decoded_offset,
-            header: frame.header,
-            reason: "record class is not custom".to_owned(),
-        });
+        return Ok(None);
+    }
+    let subtype = custom_subtype(frame);
+    if !matches!(subtype, CUSTOM_DATA | CUSTOM_NAME | CUSTOM_UNITS) {
+        return Ok(None);
     }
     let descriptor = ((frame.header >> 8) & 0xffff) as u16;
     if descriptor & 0x0f != 0 {
@@ -292,12 +326,16 @@ fn parse_custom_header(frame: &RawFrame) -> Result<CustomHeader> {
             reason: "signal index zero is reserved".to_owned(),
         });
     }
-    Ok(CustomHeader {
+    Ok(Some(CustomHeader {
         raw_id: (index << 16) | 0xff00,
         type_code,
         exact_len,
-        subtype: ((frame.header >> 24) & 0x1f) as u8,
-    })
+        subtype,
+    }))
+}
+
+fn custom_subtype(frame: &RawFrame) -> u8 {
+    ((frame.header >> 24) & 0x1f) as u8
 }
 
 fn exact_payload(frame: &RawFrame, custom: CustomHeader) -> Result<&[u8]> {
@@ -485,6 +523,23 @@ fn read_u32(payload: &[u8], offset: &mut usize) -> std::result::Result<u32, Stri
 mod tests {
     use super::*;
 
+    fn frame_with_header(header: u32) -> RawFrame {
+        RawFrame {
+            decoded_offset: 12,
+            compressed_byte_offset: 90,
+            compressed_bit: 0,
+            header,
+            arbitration_id: header & 0x1fff_ffff,
+            record_class: (header >> 29) as u8,
+            encoded_timestamp_us: 0,
+            timestamp_us: 1,
+            dlc: 0,
+            dlc_flags: 0,
+            payload_delta: Vec::new(),
+            payload: Vec::new(),
+        }
+    }
+
     #[test]
     fn units_metadata_is_stable() {
         assert_eq!(units_metadata(""), "{}");
@@ -510,21 +565,29 @@ mod tests {
     }
 
     #[test]
+    fn unknown_class_seven_subtype_is_reported_as_unsupported() {
+        let frame = frame_with_header(0xf000_0101);
+        assert!(parse_known_custom_header(&frame).unwrap().is_none());
+
+        let mut observed = BTreeMap::new();
+        observe_physical_frame(&mut observed, &frame);
+        let info = observed.values().next().unwrap();
+        assert_eq!(info.record_class, CUSTOM_CLASS);
+        assert_eq!(info.count, 1);
+    }
+
+    #[test]
+    fn malformed_known_custom_subtype_remains_an_error() {
+        let frame = frame_with_header(0xe100_0101);
+        assert!(matches!(
+            parse_known_custom_header(&frame),
+            Err(HootError::InvalidCustomDescriptor { .. })
+        ));
+    }
+
+    #[test]
     fn neutral_values_cover_every_custom_family() {
-        let frame = RawFrame {
-            decoded_offset: 12,
-            compressed_byte_offset: 90,
-            compressed_bit: 0,
-            header: 0xe000_0001,
-            arbitration_id: 1,
-            record_class: CUSTOM_CLASS,
-            encoded_timestamp_us: 0,
-            timestamp_us: 1,
-            dlc: 0,
-            dlc_flags: 0,
-            payload_delta: Vec::new(),
-            payload: Vec::new(),
-        };
+        let frame = frame_with_header(0xe000_0001);
         let decode = |signal_type, payload: &[u8]| {
             decode_value(signal_type, payload, &frame, 0x1ff00).unwrap()
         };

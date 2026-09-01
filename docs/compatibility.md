@@ -55,5 +55,7 @@ artifacts.
 - Firmware catalogs other than major version 26 are not included.
 - Physical records without a selected semantic definition are reported rather
   than silently assigned a meaning.
+- Class-7 subtypes outside the implemented data, name, and units layouts are
+  reported as unsupported physical records.
 - Exact handling of new device families or future record groups requires new,
   independently authored definitions and synthetic coverage.

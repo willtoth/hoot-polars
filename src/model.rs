@@ -261,9 +261,13 @@ pub struct SchemaReport {
     pub schema: HootSchema,
     pub raw_frames: u64,
     pub custom_frames: u64,
+    /// Minimum timestamp among record layouts that can emit semantic updates.
     pub min_timestamp_us: Option<i64>,
+    /// Maximum timestamp among record layouts that can emit semantic updates.
     pub max_timestamp_us: Option<i64>,
+    /// Number of timestamp regressions among semantic-update candidates.
     pub out_of_order_frames: u64,
+    /// Largest timestamp regression among semantic-update candidates.
     pub max_out_of_order_us: u64,
     pub unsupported_frames: Vec<UnsupportedFrameInfo>,
     pub recovered_tail: Option<crate::framing::TailRecovery>,

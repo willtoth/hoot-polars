@@ -612,6 +612,19 @@ fn is_standalone_status_base(base: u32) -> bool {
     is_timesync_group_base(base) || matches!(base, TALON_MOTOR_CONSTANTS_BASE | TALON_FAULTS_BASE)
 }
 
+pub(crate) fn is_update_candidate(frame: &RawFrame) -> bool {
+    if !matches!(frame.record_class, 1 | 3) {
+        return false;
+    }
+    let base = frame.arbitration_id & FRAME_BASE_MASK;
+    match frame.payload.len() {
+        6 => base == TALON_VERSION_BASE,
+        8 => is_standalone_status_base(base),
+        64 => frame.record_class == 3 && base == TALON_FD_BUNDLE_BASE,
+        _ => false,
+    }
+}
+
 pub(crate) fn apply_selection(schema: &mut HootSchema, selection: CatalogSelection) {
     for device in selection.devices {
         schema.insert_device(device);
@@ -1343,6 +1356,31 @@ mod tests {
             .is_some()
         );
         assert!(classify(&frame(TALON_VERSION_BASE | 9, 1, "000000000000"), &schema).is_some());
+    }
+
+    #[test]
+    fn update_candidates_match_catalog_frame_layouts() {
+        assert!(is_update_candidate(&frame(
+            TALON_VERSION_BASE | 9,
+            1,
+            "000000000000"
+        )));
+        assert!(is_update_candidate(&frame(
+            TALON_MOTION_BASE | 9,
+            1,
+            "0000000000000000"
+        )));
+        assert!(is_update_candidate(&frame(
+            TALON_FD_BUNDLE_BASE | 9,
+            3,
+            &"00".repeat(64)
+        )));
+        assert!(!is_update_candidate(&frame(0x0900_0000, 3, "0000")));
+        assert!(!is_update_candidate(&frame(
+            TALON_FD_BUNDLE_BASE | 9,
+            3,
+            ""
+        )));
     }
 
     #[test]

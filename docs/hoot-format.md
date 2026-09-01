@@ -69,6 +69,11 @@ implemented logical families are:
 - UTF-8 string;
 - arrays of each non-raw scalar family.
 
+Only the data, name, and units subtypes with the implemented descriptor layout
+are interpreted. Other class-7 subtypes remain visible as unsupported physical
+records. A malformed descriptor in one of the implemented subtypes is still an
+error.
+
 Fixed-width arrays reject trailing partial elements. String arrays use a
 sequence of little-endian 32-bit lengths followed by UTF-8 bytes. Unknown type
 codes and invalid UTF-8 are reported explicitly.
@@ -85,6 +90,11 @@ query records can reuse the most recent compatible status payload where the
 wire representation requires it. Unrecognized physical records remain in the
 schema report with their counts, offsets, deltas, and first reconstructed
 payload.
+
+Timestamp disorder used to size the conversion reorder buffer is measured only
+from implemented custom data and physical catalog candidates. Timestamps on
+unsupported control or physical records cannot force unrelated telemetry to be
+buffered.
 
 Catalog columns use `device_<id>_<snake_case_signal>`. Custom signals retain
 their embedded names.
